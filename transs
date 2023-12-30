@@ -1,0 +1,68 @@
+#!/bin/bash
+
+fn_chnroute=/usr/local/etc/transs/chnroute.txt
+fn_direct_addrs=/usr/local/etc/transs/direct_addrs.txt
+direct_groups=direct-internet
+dev=$(ip route | awk '/default via/{ print $5 }')
+
+
+refresh() {
+    curl -s 'http://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest' | grep ipv4 | grep CN | awk -F\| '{ printf("%s/%d\n", $4, 32-log($5)/log(2)) }' > $fn_chnroute
+}
+
+up() {
+    down
+
+    [ -r $fn_chnroute ] || refresh
+
+    dom_ips=dom_ips
+    if ! ipset list -name | grep -q $dom_ips; then
+        ipset create $dom_ips hash:net
+        cat $fn_chnroute | xargs -I {} ipset add $dom_ips {}
+    fi
+
+    iptables -t nat -N DIVERGE &>/dev/null
+    iptables -t nat -F DIVERGE
+
+    # Don't redirect traffic to some addrs such as ss servers
+    if [ -f $fn_direct_addrs ]; then
+        cat $fn_direct_addrs | xargs -I {} iptables -t nat -A DIVERGE -d {} -j RETURN
+    fi
+
+    # Don't redirect traffic to local networks
+    iptables -t nat -A DIVERGE -d 0.0.0.0/8 -j RETURN
+    iptables -t nat -A DIVERGE -d 10.0.0.0/8 -j RETURN
+    iptables -t nat -A DIVERGE -d 127.0.0.0/8 -j RETURN
+    iptables -t nat -A DIVERGE -d 169.254.0.0/16 -j RETURN
+    iptables -t nat -A DIVERGE -d 172.16.0.0/12 -j RETURN
+    iptables -t nat -A DIVERGE -d 192.168.0.0/16 -j RETURN
+    iptables -t nat -A DIVERGE -d 224.0.0.0/4 -j RETURN
+    iptables -t nat -A DIVERGE -d 240.0.0.0/4 -j RETURN
+
+    iptables -t nat -A DIVERGE -m set --match-set $dom_ips dst -j RETURN
+
+    IFS=':' direct_groups_arr=($direct_groups)
+    for g in "${direct_groups_arr[@]}"
+    do
+        if getent group $g &>/dev/null; then
+            iptables -t nat -A DIVERGE -m owner --gid-owner $g -j RETURN
+        fi
+    done
+
+    iptables -t nat -A DIVERGE -p tcp -j REDIRECT --to-ports 9001
+
+    iptables -t nat -A OUTPUT -o $dev -j DIVERGE
+}
+
+down() {
+    iptables -t nat -D OUTPUT -o $dev -j DIVERGE &>/dev/null
+}
+
+cmd=$1
+case "$cmd" in
+    "")         up ;;
+    up)         up ;;
+    down)       down ;;
+    refresh)    refresh ;;
+    *)          echo "unknown command '$cmd'"; exit 1 ;;
+esac
